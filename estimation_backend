@@ -1,0 +1,311 @@
+import os
+import pandas as pd
+import json
+import pickle
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
+import re
+from datetime import datetime
+import logging
+from dataclasses import dataclass
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class CapabilityInfo:
+    """Data class to store capability information"""
+    capability_name: str
+    scope_description: str
+    business_description: str
+    system_changes: str
+    project_tshirt: str
+    estimation_cost: str
+    file_path: str
+    sheet_name: str
+    row_index: int
+
+class ExcelEstimationParser:
+    """Main class for parsing Excel estimation files and searching capabilities"""
+    
+    def __init__(self, folder_path: str, cache_file: str = "capability_cache.pkl"):
+        self.folder_path = Path(folder_path)
+        self.cache_file = cache_file
+        self.capabilities_db: List[CapabilityInfo] = []
+        self.vectorizer = TfidfVectorizer(
+            stop_words='english',
+            ngram_range=(1, 2),
+            max_features=5000,
+            lowercase=True
+        )
+        self.capability_vectors = None
+        
+    def parse_excel_files(self, force_refresh: bool = False) -> None:
+        """Parse all Excel files in the folder and extract capability information"""
+        
+        # Check if cache exists and is recent
+        if not force_refresh and os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    self.capabilities_db = cached_data['capabilities']
+                    self.capability_vectors = cached_data['vectors']
+                    self.vectorizer = cached_data['vectorizer']
+                logger.info(f"Loaded {len(self.capabilities_db)} capabilities from cache")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}. Rebuilding...")
+        
+        logger.info(f"Parsing Excel files in: {self.folder_path}")
+        
+        # Find all Excel files
+        excel_files = list(self.folder_path.glob("*.xlsx")) + list(self.folder_path.glob("*.xls"))
+        
+        for excel_file in excel_files:
+            logger.info(f"Processing: {excel_file.name}")
+            try:
+                self._parse_single_excel(excel_file)
+            except Exception as e:
+                logger.error(f"Error parsing {excel_file}: {e}")
+        
+        # Create text corpus for vectorization
+        if self.capabilities_db:
+            self._create_search_vectors()
+            self._save_cache()
+        
+        logger.info(f"Parsed {len(self.capabilities_db)} capabilities from {len(excel_files)} files")
+    
+    def _parse_single_excel(self, file_path: Path) -> None:
+        """Parse a single Excel file and extract capability information"""
+        try:
+            # Read all sheets
+            excel_file = pd.ExcelFile(file_path)
+            sheets = excel_file.sheet_names
+            
+            # Look for the main sheets
+            capability_sheet = None
+            tshirt_sheet = None
+            
+            for sheet in sheets:
+                sheet_lower = sheet.lower()
+                if 'capability' in sheet_lower and 'list' in sheet_lower:
+                    capability_sheet = sheet
+                elif 'project' in sheet_lower and 't-shirt' in sheet_lower:
+                    tshirt_sheet = sheet
+            
+            if not capability_sheet:
+                logger.warning(f"No 'Capability List' sheet found in {file_path.name}")
+                return
+            
+            # Read capability sheet
+            capability_df = pd.read_excel(file_path, sheet_name=capability_sheet)
+            
+            # Read t-shirt sheet if available
+            tshirt_df = None
+            if tshirt_sheet:
+                tshirt_df = pd.read_excel(file_path, sheet_name=tshirt_sheet)
+            
+            # Process each row in capability sheet
+            self._extract_capabilities_from_sheet(
+                capability_df, tshirt_df, file_path, capability_sheet
+            )
+            
+        except Exception as e:
+            logger.error(f"Error parsing {file_path}: {e}")
+    
+    def _extract_capabilities_from_sheet(
+        self, 
+        capability_df: pd.DataFrame, 
+        tshirt_df: Optional[pd.DataFrame],
+        file_path: Path,
+        sheet_name: str
+    ) -> None:
+        """Extract capability information from dataframes"""
+        
+        # Normalize column names
+        capability_df.columns = [col.strip().lower() for col in capability_df.columns]
+        
+        # Try to identify relevant columns
+        capability_col = self._find_column(capability_df, ['capability', 'name', 'feature'])
+        scope_col = self._find_column(capability_df, ['scope', 'description'])
+        business_col = self._find_column(capability_df, ['business', 'requirement'])
+        system_col = self._find_column(capability_df, ['system', 'changes', 'technical'])
+        
+        for idx, row in capability_df.iterrows():
+            try:
+                capability_name = str(row.get(capability_col, '')).strip() if capability_col else ''
+                
+                if not capability_name or capability_name.lower() in ['nan', 'none', '']:
+                    continue
+                
+                # Extract information
+                scope_desc = str(row.get(scope_col, '')).strip() if scope_col else ''
+                business_desc = str(row.get(business_col, '')).strip() if business_col else ''
+                system_changes = str(row.get(system_col, '')).strip() if system_col else ''
+                
+                # Look for corresponding t-shirt sizing
+                tshirt_info = self._find_tshirt_info(capability_name, tshirt_df)
+                
+                capability_info = CapabilityInfo(
+                    capability_name=capability_name,
+                    scope_description=scope_desc,
+                    business_description=business_desc,
+                    system_changes=system_changes,
+                    project_tshirt=tshirt_info.get('size', ''),
+                    estimation_cost=tshirt_info.get('cost', ''),
+                    file_path=str(file_path),
+                    sheet_name=sheet_name,
+                    row_index=idx
+                )
+                
+                self.capabilities_db.append(capability_info)
+                
+            except Exception as e:
+                logger.error(f"Error processing row {idx}: {e}")
+    
+    def _find_column(self, df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+        """Find column that matches any of the keywords"""
+        for col in df.columns:
+            col_lower = str(col).lower()
+            for keyword in keywords:
+                if keyword in col_lower:
+                    return col
+        return None
+    
+    def _find_tshirt_info(self, capability_name: str, tshirt_df: Optional[pd.DataFrame]) -> Dict[str, str]:
+        """Find t-shirt sizing information for a capability"""
+        if tshirt_df is None or tshirt_df.empty:
+            return {'size': '', 'cost': ''}
+        
+        # Normalize column names
+        tshirt_df.columns = [col.strip().lower() for col in tshirt_df.columns]
+        
+        # Look for the capability in t-shirt sheet
+        capability_col = self._find_column(tshirt_df, ['capability', 'name', 'feature'])
+        size_col = self._find_column(tshirt_df, ['size', 't-shirt', 'sizing'])
+        cost_col = self._find_column(tshirt_df, ['cost', 'estimation', 'effort'])
+        
+        if not capability_col:
+            return {'size': '', 'cost': ''}
+        
+        for _, row in tshirt_df.iterrows():
+            row_capability = str(row.get(capability_col, '')).strip().lower()
+            if capability_name.lower() in row_capability or row_capability in capability_name.lower():
+                return {
+                    'size': str(row.get(size_col, '')).strip() if size_col else '',
+                    'cost': str(row.get(cost_col, '')).strip() if cost_col else ''
+                }
+        
+        return {'size': '', 'cost': ''}
+    
+    def _create_search_vectors(self) -> None:
+        """Create TF-IDF vectors for search functionality"""
+        # Create text corpus combining all relevant fields
+        corpus = []
+        for cap in self.capabilities_db:
+            text = f"{cap.capability_name} {cap.scope_description} {cap.business_description} {cap.system_changes}"
+            corpus.append(text)
+        
+        # Fit vectorizer and transform corpus
+        self.capability_vectors = self.vectorizer.fit_transform(corpus)
+        logger.info("Created search vectors for capabilities")
+    
+    def search_capabilities(self, query: str, top_k: int = 3) -> List[Tuple[CapabilityInfo, float]]:
+        """Search for capabilities based on query and return top matches"""
+        if not self.capabilities_db or self.capability_vectors is None:
+            return []
+        
+        # Transform query
+        query_vector = self.vectorizer.transform([query])
+        
+        # Calculate similarities
+        similarities = cosine_similarity(query_vector, self.capability_vectors).flatten()
+        
+        # Get top matches
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        
+        results = []
+        for idx in top_indices:
+            if similarities[idx] > 0.1:  # Minimum similarity threshold
+                results.append((self.capabilities_db[idx], similarities[idx]))
+        
+        return results
+    
+    def get_capability_summary(self, capability_info: CapabilityInfo) -> str:
+        """Generate a summary for a capability"""
+        summary = f"**Capability**: {capability_info.capability_name}\n\n"
+        
+        if capability_info.scope_description:
+            summary += f"**Scope**: {capability_info.scope_description}\n\n"
+        
+        if capability_info.business_description:
+            summary += f"**Business Description**: {capability_info.business_description}\n\n"
+        
+        if capability_info.system_changes:
+            summary += f"**System Changes**: {capability_info.system_changes}\n\n"
+        
+        if capability_info.project_tshirt:
+            summary += f"**T-Shirt Size**: {capability_info.project_tshirt}\n\n"
+        
+        if capability_info.estimation_cost:
+            summary += f"**Estimation/Cost**: {capability_info.estimation_cost}\n\n"
+        
+        summary += f"**Source**: {Path(capability_info.file_path).name} - {capability_info.sheet_name}\n"
+        
+        return summary
+    
+    def _save_cache(self) -> None:
+        """Save parsed data to cache"""
+        try:
+            cache_data = {
+                'capabilities': self.capabilities_db,
+                'vectors': self.capability_vectors,
+                'vectorizer': self.vectorizer,
+                'timestamp': datetime.now().isoformat()
+            }
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+            logger.info("Saved data to cache")
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
+    
+    def get_all_capability_names(self) -> List[str]:
+        """Get list of all capability names"""
+        return [cap.capability_name for cap in self.capabilities_db]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about the parsed data"""
+        if not self.capabilities_db:
+            return {}
+        
+        files = set(cap.file_path for cap in self.capabilities_db)
+        
+        return {
+            'total_capabilities': len(self.capabilities_db),
+            'total_files': len(files),
+            'files_processed': list(files),
+            'capability_names': self.get_all_capability_names()
+        }
+
+# Usage example and testing
+if __name__ == "__main__":
+    # Initialize parser
+    parser = ExcelEstimationParser("path/to/excel/files")
+    
+    # Parse files
+    parser.parse_excel_files()
+    
+    # Get statistics
+    stats = parser.get_stats()
+    print(f"Parsed {stats['total_capabilities']} capabilities from {stats['total_files']} files")
+    
+    # Test search
+    results = parser.search_capabilities("entitlement", top_k=3)
+    for cap_info, similarity in results:
+        print(f"\nSimilarity: {similarity:.3f}")
+        print(parser.get_capability_summary(cap_info))
+        print("-" * 50)
