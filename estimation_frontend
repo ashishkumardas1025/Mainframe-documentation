@@ -1,0 +1,290 @@
+import streamlit as st
+import os
+import json
+import boto3
+from botocore.exceptions import ClientError
+import urllib3
+from typing import Dict, Any, Optional, Union, List
+import warnings
+from pathlib import Path
+import pandas as pd
+from datetime import datetime
+
+# Import the backend parser
+from backend_parser import ExcelEstimationParser, CapabilityInfo
+
+# Configure warnings and disable insecure request warnings
+warnings.filterwarnings("ignore", category=UserWarning, message="Unverified HTTPS request")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Model configuration
+MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"  # Claude 3.5 Sonnet model ID
+
+def initialize_bedrock_client():
+    """Initialize and return AWS Bedrock client with credentials from environment variables"""
+    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_session_token = os.getenv("AWS_SESSION_TOKEN")
+
+    session = boto3.Session(
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token
+    )
+
+    bedrock = session.client(service_name='bedrock-runtime', region_name='us-east-1', verify=False)
+    return bedrock
+
+def invoke_bedrock_claude(
+    prompt: str, 
+    system: Optional[str] = None, 
+    max_tokens: int = 2000, 
+    temperature: float = 0.1
+) -> str:
+    """Invoke Claude model through AWS Bedrock"""
+    bedrock = initialize_bedrock_client()
+    
+    request_payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": prompt}]
+            }
+        ]
+    }
+    
+    if system:
+        request_payload["system"] = system
+        
+    try:
+        response = bedrock.invoke_model(
+            modelId=MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(request_payload).encode("utf-8")
+        )
+        response_body = json.loads(response["body"].read().decode("utf-8"))
+        return response_body["content"][0]["text"]
+    except ClientError as e:
+        st.error(f"AWS Error: Cannot invoke '{MODEL_ID}'. Reason: {e}")
+        raise
+    except Exception as e:
+        st.error(f"General Error: {e}")
+        raise
+
+@st.cache_resource
+def load_parser(folder_path: str):
+    """Load and cache the Excel parser"""
+    parser = ExcelEstimationParser(folder_path)
+    parser.parse_excel_files()
+    return parser
+
+def create_enhanced_prompt(query: str, search_results: List[tuple]) -> str:
+    """Create an enhanced prompt with search results context"""
+    
+    context = ""
+    if search_results:
+        context = "Based on the following capability information from previous projects:\n\n"
+        
+        for i, (cap_info, similarity) in enumerate(search_results, 1):
+            context += f"## Result {i} (Relevance: {similarity:.1%})\n"
+            context += f"**Capability**: {cap_info.capability_name}\n"
+            
+            if cap_info.scope_description:
+                context += f"**Scope**: {cap_info.scope_description}\n"
+            
+            if cap_info.business_description:
+                context += f"**Business Description**: {cap_info.business_description}\n"
+            
+            if cap_info.system_changes:
+                context += f"**System Changes**: {cap_info.system_changes}\n"
+            
+            if cap_info.project_tshirt:
+                context += f"**T-Shirt Size**: {cap_info.project_tshirt}\n"
+            
+            if cap_info.estimation_cost:
+                context += f"**Estimation/Cost**: {cap_info.estimation_cost}\n"
+            
+            context += f"**Source**: {Path(cap_info.file_path).name} - {cap_info.sheet_name}\n\n"
+            context += "---\n\n"
+    
+    prompt = f"""
+    {context}
+    
+    User Query: {query}
+    
+    Please provide a comprehensive summary based on the capability information above. Include:
+    1. A clear explanation of the capability/feature
+    2. Key scope and business requirements
+    3. Technical implementation details
+    4. Sizing and cost estimates if available
+    5. References to the source files
+    
+    If no relevant information is found, provide general guidance about the queried capability.
+    """
+    
+    return prompt
+
+def main():
+    st.set_page_config(
+        page_title="Capability Estimation Chatbot",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    st.title("🤖 Capability Estimation Chatbot")
+    st.markdown("Ask me about any capability or feature from your estimation files!")
+
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        # Folder path input
+        folder_path = st.text_input(
+            "Excel Files Folder Path",
+            value="./excel_files",
+            help="Path to the folder containing Excel estimation files"
+        )
+        
+        # Refresh data button
+        if st.button("🔄 Refresh Data", help="Re-parse Excel files"):
+            st.cache_resource.clear()
+            st.success("Cache cleared! Data will be refreshed on next query.")
+        
+        # Display statistics
+        if folder_path and os.path.exists(folder_path):
+            try:
+                parser = load_parser(folder_path)
+                stats = parser.get_stats()
+                
+                if stats:
+                    st.header("📊 Data Statistics")
+                    st.metric("Total Capabilities", stats['total_capabilities'])
+                    st.metric("Files Processed", stats['total_files'])
+                    
+                    with st.expander("View File List"):
+                        for file_path in stats['files_processed']:
+                            st.write(f"📄 {Path(file_path).name}")
+                    
+                    with st.expander("View All Capabilities"):
+                        for cap_name in stats['capability_names'][:20]:  # Show first 20
+                            st.write(f"• {cap_name}")
+                        if len(stats['capability_names']) > 20:
+                            st.write(f"... and {len(stats['capability_names']) - 20} more")
+                            
+            except Exception as e:
+                st.error(f"Error loading data: {e}")
+        else:
+            st.warning("Please provide a valid folder path")
+
+    # Main chat interface
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask about any capability (e.g., 'Tell me about entitlement features')"):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Generate assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Searching through estimation files..."):
+                try:
+                    # Check if folder path is valid
+                    if not folder_path or not os.path.exists(folder_path):
+                        st.error("Please provide a valid folder path in the sidebar.")
+                        st.stop()
+                    
+                    # Load parser and search
+                    parser = load_parser(folder_path)
+                    search_results = parser.search_capabilities(prompt, top_k=3)
+                    
+                    # Show search results summary
+                    if search_results:
+                        st.info(f"Found {len(search_results)} relevant capabilities in the database")
+                        
+                        # Display search results in expandable sections
+                        for i, (cap_info, similarity) in enumerate(search_results, 1):
+                            with st.expander(f"📋 {cap_info.capability_name} (Relevance: {similarity:.1%})"):
+                                st.markdown(parser.get_capability_summary(cap_info))
+                    else:
+                        st.warning("No direct matches found in the database. Providing general guidance.")
+                    
+                    # Generate enhanced response using Claude
+                    enhanced_prompt = create_enhanced_prompt(prompt, search_results)
+                    
+                    system_prompt = """You are an expert project estimation assistant. 
+                    Analyze the provided capability information and create comprehensive, 
+                    actionable summaries. Focus on practical insights for project planning 
+                    and estimation. Be concise but thorough."""
+                    
+                    response = invoke_bedrock_claude(
+                        enhanced_prompt,
+                        system=system_prompt,
+                        max_tokens=2000,
+                        temperature=0.1
+                    )
+                    
+                    st.markdown(response)
+                    
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    
+                except Exception as e:
+                    error_msg = f"Error processing request: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+    # Quick action buttons
+    st.markdown("---")
+    st.subheader("🚀 Quick Actions")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if st.button("💰 Show Entitlement Features"):
+            st.session_state.messages.append({"role": "user", "content": "Tell me about entitlement features and capabilities"})
+            st.rerun()
+    
+    with col2:
+        if st.button("📊 Show High Cost Items"):
+            st.session_state.messages.append({"role": "user", "content": "What are the high cost or large sized capabilities?"})
+            st.rerun()
+    
+    with col3:
+        if st.button("🔍 Search Authentication"):
+            st.session_state.messages.append({"role": "user", "content": "Show me authentication related capabilities"})
+            st.rerun()
+    
+    with col4:
+        if st.button("📋 List All Capabilities"):
+            st.session_state.messages.append({"role": "user", "content": "List all available capabilities in the database"})
+            st.rerun()
+
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center; color: gray; font-size: 12px;'>
+        💡 Tip: Ask specific questions about capabilities, features, or technical requirements<br>
+        🔄 Use 'Refresh Data' in sidebar if you've added new Excel files
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+if __name__ == "__main__":
+    main()
